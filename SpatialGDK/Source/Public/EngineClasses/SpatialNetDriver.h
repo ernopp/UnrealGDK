@@ -95,8 +95,6 @@ public:
 
 	void WipeWorld(const USpatialNetDriver::ServerTravelDelegate& LoadSnapshotAfterWorldWipe);
 
-	void LoadSnapshot();
-
 	UPROPERTY()
 	USpatialWorkerConnection* Connection;
 	UPROPERTY()
