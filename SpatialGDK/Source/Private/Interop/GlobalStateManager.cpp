@@ -54,7 +54,7 @@ void UGlobalStateManager::ApplyMapData(const Worker_ComponentData& Data)
 		{
 			if (bDataAcceptingPlayers != bAcceptingPlayers)
 			{
-				UE_LOG(LogGlobalStateManager, Error, TEXT("ApplyMapData - Accepting new players"));
+				UE_LOG(LogGlobalStateManager, Error, TEXT("GlobalStateManager ApplyMapData - AcceptingPlayers: %s"), bDataAcceptingPlayers ? TEXT("true") : TEXT("false"));
 				bAcceptingPlayers = bDataAcceptingPlayers;
 				AcceptingPlayersChanged.ExecuteIfBound(bAcceptingPlayers);
 			}
@@ -96,10 +96,10 @@ void UGlobalStateManager::ApplyMapUpdate(const Worker_ComponentUpdate& Update)
 
 	if (Schema_GetBoolCount(ComponentObject, SpatialConstants::GLOBAL_STATE_MANAGER_ACCEPTING_PLAYERS_ID) == 1)
 	{
-		UE_LOG(LogGlobalStateManager, Error, TEXT("GlobalStateManager Update - Accepting new players"));
 		bool bUpdateAcceptingPlayers = bool(Schema_GetBool(ComponentObject, SpatialConstants::GLOBAL_STATE_MANAGER_ACCEPTING_PLAYERS_ID));
 		if (bUpdateAcceptingPlayers != bAcceptingPlayers)
 		{
+			UE_LOG(LogGlobalStateManager, Error, TEXT("GlobalStateManager Update - AcceptingPlayers: %s"), bUpdateAcceptingPlayers ? TEXT("true") : TEXT("false"));
 			bAcceptingPlayers = bUpdateAcceptingPlayers;
 			AcceptingPlayersChanged.ExecuteIfBound(bAcceptingPlayers);
 		}
@@ -202,6 +202,63 @@ void UGlobalStateManager::UpdateSingletonEntityId(const FString& ClassName, cons
 	NetDriver->Connection->SendComponentUpdate(GlobalStateManagerEntityId, &Update);
 }
 
+void UGlobalStateManager::GetSingletonActorAndChannel(FString ClassName, AActor*& OutActor, USpatialActorChannel*& OutChannel)
+{
+	OutActor = nullptr;
+	OutChannel = nullptr;
+
+	UClass* SingletonActorClass = LoadObject<UClass>(nullptr, *ClassName);
+
+	if (SingletonActorClass == nullptr)
+	{
+		UE_LOG(LogGlobalStateManager, Error, TEXT("Failed to find Singleton Actor Class."));
+		return;
+	}
+
+	if (TPair<AActor*, USpatialActorChannel*>* Pair = NetDriver->SingletonActorChannels.Find(SingletonActorClass))
+	{
+		OutActor = Pair->Key;
+		OutChannel = Pair->Value;
+		return;
+	}
+
+	// Class doesn't exist in our map, have to find actor and create channel
+	// Get Singleton Actor in world
+	TArray<AActor*> SingletonActorList;
+	UGameplayStatics::GetAllActorsOfClass(NetDriver->GetWorld(), SingletonActorClass, SingletonActorList);
+
+	if (SingletonActorList.Num() == 0)
+	{
+		UE_LOG(LogGlobalStateManager, Error, TEXT("No Singletons of type %s exist!"), *ClassName);
+		return;
+	}
+
+	if (SingletonActorList.Num() > 1)
+	{
+		UE_LOG(LogGlobalStateManager, Error, TEXT("More than one Singleton Actor exists of type %s"), *ClassName);
+		return;
+	}
+
+	OutActor = SingletonActorList[0];
+
+	USpatialNetConnection* Connection = Cast<USpatialNetConnection>(NetDriver->ClientConnections[0]);
+
+	OutChannel = (USpatialActorChannel*)Connection->CreateChannel(CHTYPE_Actor, 1);
+	NetDriver->SingletonActorChannels.Add(SingletonActorClass, TPair<AActor*, USpatialActorChannel*>(OutActor, OutChannel));
+}
+
+bool UGlobalStateManager::IsSingletonEntity(Worker_EntityId EntityId)
+{
+	for (const auto& Pair : SingletonNameToEntityId)
+	{
+		if (Pair.Value == EntityId)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 void UGlobalStateManager::ToggleAcceptingPlayers(bool bInAcceptingPlayers)
 {
 	if (!bHasLiveMapAuthority || !Cast<USpatialGameInstance>(NetDriver->GetWorld()->GetGameInstance())->bIsWorkerAuthorativeOverGSM)
@@ -232,7 +289,7 @@ void UGlobalStateManager::ToggleAcceptingPlayers(bool bInAcceptingPlayers)
 		{
 			UE_LOG(LogGlobalStateManager, Error, TEXT("Tried to toggle AcceptingPlayers but the query for the GSM failed. Trying again in 3 seconds."));
 			FTimerHandle RetryTimer;
-			TimerManager->SetTimer(RetryTimer, [this, bInAcceptingPlayers]() 
+			TimerManager->SetTimer(RetryTimer, [this, bInAcceptingPlayers]()
 			{
 				ToggleAcceptingPlayers(bInAcceptingPlayers);
 			}, 3.f, false);
@@ -336,6 +393,8 @@ bool UGlobalStateManager::IsSingletonEntity(Worker_EntityId EntityId)
 	return false;
 }
 
+// Queries for the GlobalStateManager in the deployment.
+// bWithRetry will continue querying until the state of AcceptingPlayers is true, this is so clients know when to connect to the deployment.
 void UGlobalStateManager::QueryGSM(bool bWithRetry)
 {
 	Worker_ComponentConstraint GSMComponentConstraint{};
@@ -357,7 +416,7 @@ void UGlobalStateManager::QueryGSM(bool bWithRetry)
 	{
 		if (Op.status_code != WORKER_STATUS_CODE_SUCCESS || Op.result_count == 0)
 		{
-			UE_LOG(LogGlobalStateManager, Error, TEXT("Could not find GSM via entity query: %s"), Op.message);
+			UE_LOG(LogGlobalStateManager, Error, TEXT("Could not find GSM via entity query: %s"), UTF8_TO_TCHAR(Op.message));
 			if (bWithRetry)
 			{
 				UE_LOG(LogGlobalStateManager, Error, TEXT("Retrying entity query for the GSM in %d seconds"), 3);
@@ -386,187 +445,22 @@ void UGlobalStateManager::QueryGSM(bool bWithRetry)
 	Receiver->AddEntityQueryDelegate(RequestID, GSMQueryDelegate);
 }
 
+void UGlobalStateManager::AuthorityChanged(bool bWorkerAuthority)
+{
+	// Make sure the GameInstance knows that this worker is now authoritative over the GSM (used for server travel).
+	// The GameInstance is the only persistent object during server travel.
+	// bIsWorkerAuthorativeOverGSM exists to inform the worker that was previously authoritative over the GSM that it has the responsibility of loading the new snapshot.
+	Cast<USpatialGameInstance>(NetDriver->GetWorld()->GetGameInstance())->bIsWorkerAuthorativeOverGSM = bWorkerAuthority;
+
+	// Also update this instance of the GSM that it has current authority (used for accepting players toggle).
+	// The instance of each GSM is destroyed on server travel and a new one is made, hence the need for 'live' authority.
+	bHasLiveMapAuthority = bWorkerAuthority;
+
+	OnAuthorityChanged.ExecuteIfBound(bWorkerAuthority);
+}
+
 void UGlobalStateManager::SetDeploymentMapURL(FString MapURL)
 {
 	UE_LOG(LogGlobalStateManager, Error, TEXT("Setting DeploymentMapURL: %s"), *MapURL);
 	DeploymentMapURL = MapURL;
 }
-
-void UGlobalStateManager::WorldWipe(const USpatialNetDriver::ServerTravelDelegate& Delegate)
-{
-	Worker_EntityIdConstraint GSMConstraintEID;
-	GSMConstraintEID.entity_id = GlobalStateManagerEntityId;
-
-	Worker_Constraint GSMConstraint;
-	GSMConstraint.constraint_type = WORKER_CONSTRAINT_TYPE_ENTITY_ID;
-	GSMConstraint.entity_id_constraint = GSMConstraintEID;
-
-	Worker_NotConstraint NotGSMConstraint;
-	NotGSMConstraint.constraint = &GSMConstraint;
-
-	Worker_Constraint WorldConstraint;
-	WorldConstraint.constraint_type = WORKER_CONSTRAINT_TYPE_NOT;
-	WorldConstraint.not_constraint = NotGSMConstraint;
-
-	Worker_EntityQuery WorldQuery{};
-	WorldQuery.constraint = WorldConstraint;
-	WorldQuery.result_type = WORKER_RESULT_TYPE_SNAPSHOT;
-
-	Worker_RequestId RequestID;
-	RequestID = NetDriver->Connection->SendEntityQueryRequest(&WorldQuery);
-
-	EntityQueryDelegate WorldQueryDelegate;
-	WorldQueryDelegate.BindLambda([this, RequestID, Delegate](Worker_EntityQueryResponseOp& Op)
-	{
-		if (Op.status_code != WORKER_STATUS_CODE_SUCCESS)
-		{
-			UE_LOG(LogGlobalStateManager, Error, TEXT("World query failed: %s"), Op.message);
-		}
-
-		if (Op.result_count == 0)
-		{
-			UE_LOG(LogGlobalStateManager, Error, TEXT("No entities in world query"));
-		}
-
-		if (Op.result_count >= 1)
-		{
-			UE_LOG(LogGlobalStateManager, Error, TEXT("Found some entities in the world query: %u"), Op.result_count);
-			DeleteEntities(Op);
-		}
-
-		Delegate.ExecuteIfBound();
-	});
-
-	Receiver->AddEntityQueryDelegate(RequestID, WorldQueryDelegate);
-}
-
-void UGlobalStateManager::DeleteEntities(const Worker_EntityQueryResponseOp& Op)
-{
-	UE_LOG(LogGlobalStateManager, Error, TEXT("Deleting entities!"));
-
-	for (uint32_t i = 0; i < Op.result_count; i++)
-	{
-		// Lets pray
-		UE_LOG(LogGlobalStateManager, Error, TEXT("- Sending delete request for: %i"), Op.results[i].entity_id);
-		NetDriver->Connection->SendDeleteEntityRequest(Op.results[i].entity_id);
-	}
-
-	// Also kill the GSM
-	NetDriver->Connection->SendDeleteEntityRequest(GlobalStateManagerEntityId);
-}
-
-void DeepCopy(Schema_Object* source, Schema_Object* target) {
-	auto length = Schema_GetWriteBufferLength(source);
-	auto buffer = Schema_AllocateBuffer(target, length);
-	Schema_WriteToBuffer(source, buffer);
-	Schema_Clear(target);
-	Schema_MergeFromBuffer(target, buffer, length);
-}
-
-Schema_ComponentData* Schema_DeepCopyComponentData(Schema_ComponentData* source) {
-	auto* copy = Schema_CreateComponentData(Schema_GetComponentDataComponentId(source));
-	DeepCopy(Schema_GetComponentDataFields(source), Schema_GetComponentDataFields(copy));
-	return copy;
-}
-
-void UGlobalStateManager::LoadSnapshot(FString SnapshotName)
-{
-	Worker_ComponentVtable DefaultVtable{};
-	Worker_SnapshotParameters Parameters{};
-	Parameters.default_component_vtable = &DefaultVtable;
-
-	FString SnapshotsDirectory = FPaths::ProjectContentDir().Append("Spatial/Snapshots/");
-	FString SnapshotPath = SnapshotsDirectory + SnapshotName + ".snapshot";;
-
-	Worker_SnapshotInputStream* Snapshot = Worker_SnapshotInputStream_Create(TCHAR_TO_UTF8(*SnapshotPath), &Parameters);
-
-	FString Error = Worker_SnapshotInputStream_GetError(Snapshot);
-	if (!Error.IsEmpty())
-	{
-		UE_LOG(LogGlobalStateManager, Error, TEXT(" Fucking error reading snapshot mate: %s"), *Error);
-		return;
-	}
-
-	TArray<TArray<Worker_ComponentData>> EntitiesToSpawn;
-
-	// Get all of the entities from the snapshot.
-	while (Snapshot && Worker_SnapshotInputStream_HasNext(Snapshot) > 0)
-	{
-		Error = Worker_SnapshotInputStream_GetError(Snapshot);
-		if (!Error.IsEmpty())
-		{
-			UE_LOG(LogGlobalStateManager, Error, TEXT("- Error when reading the HasNext.........."));
-			return;
-		}
-
-		const Worker_Entity* EntityToSpawn = Worker_SnapshotInputStream_ReadEntity(Snapshot);
-
-		Error = Worker_SnapshotInputStream_GetError(Snapshot);
-		if (Error.IsEmpty())
-		{
-			TArray<Worker_ComponentData> EntityComponents;
-			for (uint32_t i = 0; i < EntityToSpawn->component_count; ++i) {
-				// Entity component data must be deep copied so that it can be used for CreateEntityRequest.
-				auto* CopySchemaData = Schema_DeepCopyComponentData(EntityToSpawn->components[i].schema_type);
-				auto EntityComponentData = Worker_ComponentData{};
-				EntityComponentData.component_id = Schema_GetComponentDataComponentId(CopySchemaData);
-				EntityComponentData.schema_type = CopySchemaData;
-				EntityComponents.Add(EntityComponentData);
-			}
-
-			// Josh - New flow. Bulk reserve the EntityIDs and then send.
-			EntitiesToSpawn.Add(EntityComponents);
-		}
-		else
-		{
-			UE_LOG(LogGlobalStateManager, Error, TEXT("Fucking error reading entity mate: %s"), *Error);
-			// Abort
-			Worker_SnapshotInputStream_Destroy(Snapshot);
-			return;
-		}
-	}
-
-	// End it
-	Worker_SnapshotInputStream_Destroy(Snapshot);
-
-	// TODO: This needs retry logic in case of failures.
-	// Set up reserve IDs delegate
-	ReserveEntityIDsDelegate SpawnEntitiesDelegate;
-	SpawnEntitiesDelegate.BindLambda([EntitiesToSpawn, this] (Worker_ReserveEntityIdsResponseOp& Op) { // Need to get the reserved IDs in here.
-		UE_LOG(LogGlobalStateManager, Error, TEXT("Creating entities in snapshot, num of entities: %i"), Op.number_of_entity_ids);
-
-		// Ensure we have the same number of reserved IDs as we have entities to spawn
-		check(EntitiesToSpawn.Num() == Op.number_of_entity_ids);
-
-		for (uint32_t i = 0; i < Op.number_of_entity_ids; i++)
-		{
-			// Get an entity to spawn and a reserved EntityID
-			auto& EntityToSpawn = EntitiesToSpawn[i];
-			Worker_EntityId EntityID = Op.first_entity_id + i;
-
-			// Check if this is the GSM
-			for (auto& ComponentData : EntityToSpawn)
-			{
-				if (ComponentData.component_id == SpatialConstants::GLOBAL_STATE_MANAGER_COMPONENT_ID)
-				{
-					// Save the ID in this class
-					GlobalStateManagerEntityId = EntityID;
-					UE_LOG(LogGlobalStateManager, Error, TEXT("GLOBAL STATE MANAGER WILL BE: %i"), EntityID);
-				}
-			}
-
-			UE_LOG(LogGlobalStateManager, Warning, TEXT("- Sending entity create request for: %i"), EntityID);
-			NetDriver->Connection->SendCreateEntityRequest(EntityToSpawn.Num(), EntityToSpawn.GetData(), &EntityID /**Reserved entity ID**/);
-		}
-
-		ToggleAcceptingPlayers(true);
-	});
-
-	// Reserve the Entity IDs
-	Worker_RequestId ReserveRequestID = NetDriver->Connection->SendReserveEntityIdsRequest(EntitiesToSpawn.Num());
-
-	// Add the spawn delegate
-	Receiver->AddReserveEntityIdsDelegate(ReserveRequestID, SpawnEntitiesDelegate);
-}
-
-

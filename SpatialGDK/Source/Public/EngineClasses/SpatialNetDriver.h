@@ -28,6 +28,7 @@ class USpatialTypebindingManager;
 class UGlobalStateManager;
 class USpatialPlayerSpawner;
 class USpatialStaticComponentView;
+class USnapshotManager;
 
 class UEntityRegistry;
 
@@ -115,6 +116,8 @@ public:
 	USpatialStaticComponentView* StaticComponentView;
 	UPROPERTY()
 	UEntityRegistry* EntityRegistry;
+	UPROPERTY()
+	USnapshotManager* SnapshotManager;
 
 	TMap<UClass*, TPair<AActor*, USpatialActorChannel*>> SingletonActorChannels;
 
