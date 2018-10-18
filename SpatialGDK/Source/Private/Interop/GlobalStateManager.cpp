@@ -291,6 +291,9 @@ void UGlobalStateManager::ToggleAcceptingPlayers(bool bInAcceptingPlayers)
 		}
 		else if (Op.result_count == 1)
 		{
+			// We have the GSM from the query. Update our local GSM entity ID
+			GlobalStateManagerEntityId = Op.results->entity_id;
+
 			// Send the component update that we can now accept players.
 			UE_LOG(LogGlobalStateManager, Log, TEXT("Toggling accepting players to '%s'"), bInAcceptingPlayers ? TEXT("true") : TEXT("false"));
 			Worker_ComponentUpdate Update = {};
@@ -303,7 +306,6 @@ void UGlobalStateManager::ToggleAcceptingPlayers(bool bInAcceptingPlayers)
 
 			// Set the AcceptingPlayers state on the GSM
 			Schema_AddBool(UpdateObject, SpatialConstants::GLOBAL_STATE_MANAGER_ACCEPTING_PLAYERS_ID, uint8_t(bInAcceptingPlayers));
-			check(Op.results->entity_id == GlobalStateManagerEntityId);
 
 			// Component updates are short circuited so we set the updated state here and then send the component update.
 			bAcceptingPlayers = bInAcceptingPlayers;
@@ -314,7 +316,7 @@ void UGlobalStateManager::ToggleAcceptingPlayers(bool bInAcceptingPlayers)
 	Receiver->AddEntityQueryDelegate(RequestID, GSMQueryDelegate);
 }
 
-void UGlobalStateManager::AuthorityChanged(bool bWorkerAuthority)
+void UGlobalStateManager::AuthorityChanged(bool bWorkerAuthority, Worker_EntityId CurrentEntityID)
 {
 	// Make sure the GameInstance knows that this worker is now authoritative over the GSM (used for server travel).
 	// The GameInstance is the only persistent object during server travel.
@@ -324,6 +326,9 @@ void UGlobalStateManager::AuthorityChanged(bool bWorkerAuthority)
 	// Also update this instance of the GSM that it has current authority (used for accepting players toggle).
 	// The instance of each GSM is destroyed on server travel and a new one is made, hence the need for 'live' authority.
 	bHasLiveMapAuthority = bWorkerAuthority;
+
+	// Make sure we update our known entity id for the GSM when we receive authority.
+	GlobalStateManagerEntityId = CurrentEntityID;
 
 	OnAuthorityChanged.ExecuteIfBound(bWorkerAuthority);
 }
